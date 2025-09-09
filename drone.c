@@ -3,11 +3,16 @@
 #include "pico/stdlib.h"
 #include "hardware/pwm.h"
 
+#define NUM_CHANNELS 16
+#define BITS_PER_CHANNEL 11
+#define CHANNEL_DATA_BYTES NUM_CHANNELS*BITS_PER_CHANNEL/8 // 22
+
 // GPIO pins
 #define LED_PIN1 4
 #define LED_PIN2 5
 #define TX_PIN 16
 #define RX_PIN 17
+#define ESC_EN_PIN 18
 
 // ELRS UART configuration
 #define UART_ID uart0
@@ -19,10 +24,13 @@
 #define MAIN_LOOP_FREQ 2000
 
 unsigned int frame = 0;
+char channelDataRaw[CHANNEL_DATA_BYTES] = {0};
+unsigned int channelData[NUM_CHANNELS] = {0};
 
 void controlLoop();
 void setupTimer(unsigned int timer, unsigned int irq, unsigned int loopFreq, irq_handler_t function);
 void resetTimer(unsigned int timer, unsigned int sampleInterval);
+void getReceiverData(unsigned int frame);
 
 int main()
 {
@@ -32,8 +40,12 @@ int main()
 	// GPIO setup
 	gpio_init(LED_PIN1);
 	gpio_init(LED_PIN2);
+	gpio_init(ESC_EN_PIN);
 	gpio_set_dir(LED_PIN1, GPIO_OUT);
 	gpio_set_dir(LED_PIN2, GPIO_OUT);
+	gpio_set_dir(ESC_EN_PIN, GPIO_OUT);
+	gpio_put(ESC_EN_PIN, 1);
+
 	gpio_set_function(TX_PIN, GPIO_FUNC_UART);
 	gpio_set_function(RX_PIN, GPIO_FUNC_UART);
 
@@ -50,10 +62,12 @@ int main()
 		// Blink LEDs
 		gpio_put(LED_PIN1, 1);
 		gpio_put(LED_PIN2, 0);
-		sleep_ms(500);
+		sleep_ms(100);
 		gpio_put(LED_PIN1, 0);
 		gpio_put(LED_PIN2, 1);
-		sleep_ms(500);
+		sleep_ms(100);
+
+		printf("Roll: %d, Pitch: %d, Throttle: %d, Yaw: %d\n", channelData[0], channelData[1], channelData[2], channelData[3]);
 	}
 	return 0;
 }
@@ -66,10 +80,15 @@ void controlLoop()
 	resetTimer(MAIN_LOOP_TIMER, 1000000/MAIN_LOOP_FREQ);
 	frame++;
 
-	if (frame%1000 == 0) {
-		printf("%d seconds\n", frame/1000);
-	}
-	// Get data from controller
+	getReceiverData(frame);
+
+//	if (frame%1000 == 0) {
+//		for (unsigned int i = 0; i < CHANNEL_DATA_BYTES; i++) {
+//			printf("%d, ", channelData[i]);
+//		}
+//		printf("\n");
+//	}
+
 }
 
 // Configures an interrupt routine to run when the timer goes off
@@ -87,3 +106,51 @@ void resetTimer(unsigned int timer, unsigned int sampleInterval)
 	hw_clear_bits(&timer_hw->intr, 1u << timer); // ACK interrupt
 	timer_hw->alarm[timer] = timer_hw->timelr + sampleInterval;
 }
+
+// Reads input from the ELRS receiver
+void getReceiverData(unsigned int frame)
+{
+	unsigned int curChannelIndex = 0;
+	unsigned int curIndex = 0;
+	unsigned int crcIndex = 0;
+	char crcValue = 0;
+	char packetType = 0;
+	while (uart_is_readable(UART_ID)) {
+		char uartChar = uart_getc(UART_ID);
+		if (curIndex == 0) {
+			if (uartChar != 0xC8) {
+				break;
+			}
+		} else if (curIndex == 1) {
+			unsigned int frameSize = (unsigned int)uartChar;
+			crcIndex = 1 + frameSize;
+		} else if (curIndex == 2) {
+			packetType = uartChar;
+		} else if (curIndex >= 3 && curIndex < crcIndex) {
+			if (curChannelIndex < CHANNEL_DATA_BYTES && packetType == 0x16) {
+				channelDataRaw[curChannelIndex] = uartChar;
+				curChannelIndex++;
+			} else if (packetType == 0x16) {
+				printf("Error: Too many bytes received for ELRS channel data\n");
+			}
+		} else if (curIndex == crcIndex && crcIndex != 0) {
+			crcValue = uartChar;
+		}
+		curIndex++;
+	}
+
+	// Unpack channel data
+	for (unsigned int curChannel = 0; curChannel < NUM_CHANNELS; curChannel++) {
+		channelData[curChannel] = 0;
+	}
+	for (unsigned int curIndex = 0; curIndex < CHANNEL_DATA_BYTES; curIndex++) {
+		for (unsigned int curBit = 0; curBit < 8; curBit++) {
+			unsigned int curChannel = (curIndex*8 + curBit)/11;
+			unsigned int curChannelBit = (curIndex*8 + curBit)%11;
+			char insertBit = (channelDataRaw[curIndex] & (1 << curBit)) >> curBit;
+			channelData[curChannel] |= (insertBit << curChannelBit);
+		}
+	}
+
+}
+
