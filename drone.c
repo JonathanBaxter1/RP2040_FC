@@ -24,13 +24,14 @@
 #define MAIN_LOOP_FREQ 2000
 
 unsigned int frame = 0;
-char channelDataRaw[CHANNEL_DATA_BYTES] = {0};
+char packetDataRaw[CHANNEL_DATA_BYTES + 2] = {0}; // 1 byte for type, 1 byte for CRC8
 unsigned int channelData[NUM_CHANNELS] = {0};
 
 void controlLoop();
 void setupTimer(unsigned int timer, unsigned int irq, unsigned int loopFreq, irq_handler_t function);
 void resetTimer(unsigned int timer, unsigned int sampleInterval);
 void getReceiverData(unsigned int frame);
+char calculateCRC8(char* data, char divisor, unsigned int dataLenBytes);
 
 int main()
 {
@@ -81,14 +82,6 @@ void controlLoop()
 	frame++;
 
 	getReceiverData(frame);
-
-//	if (frame%1000 == 0) {
-//		for (unsigned int i = 0; i < CHANNEL_DATA_BYTES; i++) {
-//			printf("%d, ", channelData[i]);
-//		}
-//		printf("\n");
-//	}
-
 }
 
 // Configures an interrupt routine to run when the timer goes off
@@ -110,47 +103,73 @@ void resetTimer(unsigned int timer, unsigned int sampleInterval)
 // Reads input from the ELRS receiver
 void getReceiverData(unsigned int frame)
 {
-	unsigned int curChannelIndex = 0;
 	unsigned int curIndex = 0;
 	unsigned int crcIndex = 0;
-	char crcValue = 0;
+	unsigned int frameSize = 0;
 	char packetType = 0;
 	while (uart_is_readable(UART_ID)) {
 		char uartChar = uart_getc(UART_ID);
 		if (curIndex == 0) {
 			if (uartChar != 0xC8) {
-				break;
+				continue;
 			}
 		} else if (curIndex == 1) {
 			unsigned int frameSize = (unsigned int)uartChar;
 			crcIndex = 1 + frameSize;
-		} else if (curIndex == 2) {
-			packetType = uartChar;
-		} else if (curIndex >= 3 && curIndex < crcIndex) {
-			if (curChannelIndex < CHANNEL_DATA_BYTES && packetType == 0x16) {
-				channelDataRaw[curChannelIndex] = uartChar;
-				curChannelIndex++;
-			} else if (packetType == 0x16) {
-				printf("Error: Too many bytes received for ELRS channel data\n");
+		} else if (curIndex >= 2) {
+			if (curIndex == 2) {
+				packetType = uartChar;
 			}
-		} else if (curIndex == crcIndex && crcIndex != 0) {
-			crcValue = uartChar;
+			if (packetType == 0x16) {
+				// Packet data will be used for channel data and crc check
+				packetDataRaw[curIndex-2] = uartChar;
+			}
+		} else if (curIndex >= frameSize) {
+			continue;
 		}
 		curIndex++;
 	}
 
-	// Unpack channel data
-	for (unsigned int curChannel = 0; curChannel < NUM_CHANNELS; curChannel++) {
-		channelData[curChannel] = 0;
-	}
-	for (unsigned int curIndex = 0; curIndex < CHANNEL_DATA_BYTES; curIndex++) {
-		for (unsigned int curBit = 0; curBit < 8; curBit++) {
-			unsigned int curChannel = (curIndex*8 + curBit)/11;
-			unsigned int curChannelBit = (curIndex*8 + curBit)%11;
-			char insertBit = (channelDataRaw[curIndex] & (1 << curBit)) >> curBit;
-			channelData[curChannel] |= (insertBit << curChannelBit);
+	// Check CRC value
+	char crcDivisor = 0xD5;
+	if (calculateCRC8(packetDataRaw, crcDivisor, sizeof(packetDataRaw)) == 0) {
+		// Unpack channel data if CRC is correct
+		for (unsigned int curChannel = 0; curChannel < NUM_CHANNELS; curChannel++) {
+			channelData[curChannel] = 0;
 		}
+		for (unsigned int curIndex = 0; curIndex < CHANNEL_DATA_BYTES; curIndex++) {
+			for (unsigned int curBit = 0; curBit < 8; curBit++) {
+				unsigned int curChannel = (curIndex*8 + curBit)/11;
+				unsigned int curChannelBit = (curIndex*8 + curBit)%11;
+				char insertBit = (packetDataRaw[curIndex + 1] & (1 << curBit)) >> curBit;
+				channelData[curChannel] |= (insertBit << curChannelBit);
+			}
+		}
+	} else {
+		printf("Packet Lost\n");
 	}
-
 }
 
+char calculateCRC8(char* data, char divisor, unsigned int dataLenBytes) {
+	char crcRegister = 0;
+	unsigned int dataLenBits = dataLenBytes*8;
+	unsigned int inputStreamIndex = 0;
+	while (inputStreamIndex < dataLenBits) {
+		// Shift crcRegister left until MSB = 1, then shift once more
+		unsigned int lastShift = 0;
+		while (inputStreamIndex < dataLenBits) {
+			if (lastShift == 1) break;
+			if (crcRegister & 0x80 == 0x80) lastShift == 1;
+			crcRegister <<= 1;
+			unsigned int indexByte = inputStreamIndex/8;
+			unsigned int indexBit = inputStreamIndex%8;
+			char insertBit = (data[indexByte] & (1 << indexBit)) >> indexBit;
+			crcRegister |= insertBit;
+			inputStreamIndex++;
+		}
+
+		// Bitwise XOR crc register with divisor
+		crcRegister ^= divisor;
+	}
+	return crcRegister;
+}
