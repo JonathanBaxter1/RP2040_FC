@@ -24,14 +24,14 @@
 #define MAIN_LOOP_FREQ 2000
 
 unsigned int frame = 0;
-char packetDataRaw[CHANNEL_DATA_BYTES + 2] = {0}; // 1 byte for type, 1 byte for CRC8
+unsigned char packetDataRaw[CHANNEL_DATA_BYTES + 2] = {0}; // 1 byte for type, 1 byte for CRC8
 unsigned int channelData[NUM_CHANNELS] = {0};
 
 void controlLoop();
 void setupTimer(unsigned int timer, unsigned int irq, unsigned int loopFreq, irq_handler_t function);
 void resetTimer(unsigned int timer, unsigned int sampleInterval);
 void getReceiverData(unsigned int frame);
-char calculateCRC8(char* data, char divisor, unsigned int dataLenBytes);
+char calculateCRC8(unsigned char* data, unsigned char divisor, unsigned int dataLenBytes);
 
 int main()
 {
@@ -106,15 +106,15 @@ void getReceiverData(unsigned int frame)
 	unsigned int curIndex = 0;
 	unsigned int crcIndex = 0;
 	unsigned int frameSize = 0;
-	char packetType = 0;
+	unsigned char packetType = 0;
 	while (uart_is_readable(UART_ID)) {
-		char uartChar = uart_getc(UART_ID);
+		unsigned char uartChar = uart_getc(UART_ID);
 		if (curIndex == 0) {
 			if (uartChar != 0xC8) {
 				continue;
 			}
 		} else if (curIndex == 1) {
-			unsigned int frameSize = (unsigned int)uartChar;
+			frameSize = (unsigned int)uartChar;
 			crcIndex = 1 + frameSize;
 		} else if (curIndex >= 2) {
 			if (curIndex == 2) {
@@ -124,15 +124,17 @@ void getReceiverData(unsigned int frame)
 				// Packet data will be used for channel data and crc check
 				packetDataRaw[curIndex-2] = uartChar;
 			}
-		} else if (curIndex >= frameSize) {
-			continue;
+//		} else if (curIndex >= frameSize) {
+//			continue;
 		}
 		curIndex++;
 	}
 
 	// Check CRC value
-	char crcDivisor = 0xD5;
-	if (calculateCRC8(packetDataRaw, crcDivisor, sizeof(packetDataRaw)) == 0) {
+	unsigned char crcDivisor = 0xD5;
+//	printf("CRC: %d\n", sizeof(packetDataRaw));
+	unsigned char crcResult = calculateCRC8(packetDataRaw, crcDivisor, sizeof(packetDataRaw));
+	if (crcResult != 0x01) {
 		// Unpack channel data if CRC is correct
 		for (unsigned int curChannel = 0; curChannel < NUM_CHANNELS; curChannel++) {
 			channelData[curChannel] = 0;
@@ -141,7 +143,7 @@ void getReceiverData(unsigned int frame)
 			for (unsigned int curBit = 0; curBit < 8; curBit++) {
 				unsigned int curChannel = (curIndex*8 + curBit)/11;
 				unsigned int curChannelBit = (curIndex*8 + curBit)%11;
-				char insertBit = (packetDataRaw[curIndex + 1] & (1 << curBit)) >> curBit;
+				unsigned char insertBit = (packetDataRaw[curIndex + 1] & (1 << curBit)) >> curBit;
 				channelData[curChannel] |= (insertBit << curChannelBit);
 			}
 		}
@@ -150,8 +152,8 @@ void getReceiverData(unsigned int frame)
 	}
 }
 
-char calculateCRC8(char* data, char divisor, unsigned int dataLenBytes) {
-	char crcRegister = 0;
+char calculateCRC8(unsigned char* data, unsigned char divisor, unsigned int dataLenBytes) {
+	unsigned char crcRegister = 0;
 	unsigned int dataLenBits = dataLenBytes*8;
 	unsigned int inputStreamIndex = 0;
 	while (inputStreamIndex < dataLenBits) {
@@ -159,11 +161,11 @@ char calculateCRC8(char* data, char divisor, unsigned int dataLenBytes) {
 		unsigned int lastShift = 0;
 		while (inputStreamIndex < dataLenBits) {
 			if (lastShift == 1) break;
-			if (crcRegister & 0x80 == 0x80) lastShift == 1;
+			if ((crcRegister & 0x80) == 0x80) lastShift = 1;
 			crcRegister <<= 1;
 			unsigned int indexByte = inputStreamIndex/8;
 			unsigned int indexBit = inputStreamIndex%8;
-			char insertBit = (data[indexByte] & (1 << indexBit)) >> indexBit;
+			unsigned char insertBit = (data[indexByte] & (1 << indexBit)) >> indexBit;
 			crcRegister |= insertBit;
 			inputStreamIndex++;
 		}
