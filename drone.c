@@ -68,7 +68,7 @@ int main()
 		gpio_put(LED_PIN2, 1);
 		sleep_ms(100);
 
-		printf("Roll: %d, Pitch: %d, Throttle: %d, Yaw: %d\n", channelData[0], channelData[1], channelData[2], channelData[3]);
+		printf(" kek Roll: %d, Pitch: %d, Throttle: %d, Yaw: %d\n", channelData[0], channelData[1], channelData[2], channelData[3]);
 	}
 	return 0;
 }
