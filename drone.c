@@ -19,19 +19,23 @@
 #define UART_DATA_BITS 8
 #define UART_STOP_BITS 1
 #define UART_PARITY UART_PARITY_NONE
+#define UART_BUFFER_SIZE 256
 
 #define MAIN_LOOP_TIMER 0
-#define MAIN_LOOP_FREQ 2000
+#define MAIN_LOOP_FREQ 100
 
 unsigned int frame = 0;
 unsigned char packetDataRaw[CHANNEL_DATA_BYTES + 2] = {0}; // 1 byte for type, 1 byte for CRC8
 unsigned int channelData[NUM_CHANNELS] = {0};
+unsigned char uartBuffer[UART_BUFFER_SIZE] = {0};
+unsigned int uartBufferIndex = 0;
 
 void controlLoop();
 void setupTimer(unsigned int timer, unsigned int irq, unsigned int loopFreq, irq_handler_t function);
 void resetTimer(unsigned int timer, unsigned int sampleInterval);
 void getReceiverData(unsigned int frame);
 char calculateCRC8(unsigned char* data, unsigned char divisor, unsigned int dataLenBytes);
+void onUartRx();
 
 int main()
 {
@@ -50,9 +54,14 @@ int main()
 	gpio_set_function(TX_PIN, GPIO_FUNC_UART);
 	gpio_set_function(RX_PIN, GPIO_FUNC_UART);
 
-	uart_set_hw_flow(UART_ID, false, false);
+//	uart_set_hw_flow(UART_ID, false, false);
 	uart_set_format(UART_ID, UART_DATA_BITS, UART_STOP_BITS, UART_PARITY);
-	uart_set_fifo_enabled(UART_ID, true);
+//	uart_set_fifo_enabled(UART_ID, true);
+
+	// UART interrupt setup
+	uart_set_irqs_enabled(UART_ID, true, false);
+	irq_set_exclusive_handler(UART0_IRQ, onUartRx);
+	irq_set_enabled(UART0_IRQ, true);
 
 	// Control loop interrupt routine
 	setupTimer(MAIN_LOOP_TIMER, TIMER_IRQ_0, MAIN_LOOP_FREQ, controlLoop);
@@ -68,7 +77,7 @@ int main()
 		gpio_put(LED_PIN2, 1);
 		sleep_ms(100);
 
-		printf(" kek Roll: %d, Pitch: %d, Throttle: %d, Yaw: %d\n", channelData[0], channelData[1], channelData[2], channelData[3]);
+		printf("Roll: %d, Pitch: %d, Throttle: %d, Yaw: %d\n", channelData[0], channelData[1], channelData[2], channelData[3]);
 	}
 	return 0;
 }
@@ -103,38 +112,46 @@ void resetTimer(unsigned int timer, unsigned int sampleInterval)
 // Reads input from the ELRS receiver
 void getReceiverData(unsigned int frame)
 {
-	unsigned int curIndex = 0;
-	unsigned int crcIndex = 0;
-	unsigned int frameSize = 0;
-	unsigned char packetType = 0;
-	while (uart_is_readable(UART_ID)) {
-		unsigned char uartChar = uart_getc(UART_ID);
+//	static unsigned int goodPackets = 0;
+//	static unsigned int badPackets = 0;
+
+	static unsigned int curIndex = 0;
+	static unsigned int crcIndex = 0;
+	static unsigned int frameSize = 0;
+	static unsigned char packetType = 0;
+	if (uartBufferIndex == 0) return;
+	for (unsigned int i = 0; i < uartBufferIndex; i++) {
+		unsigned char uartChar = uartBuffer[i];
 		if (curIndex == 0) {
-			if (uartChar != 0xC8) {
-				continue;
-			}
+			if (uartChar != 0xC8) continue;
+			curIndex++;
 		} else if (curIndex == 1) {
 			frameSize = (unsigned int)uartChar;
 			crcIndex = 1 + frameSize;
+			curIndex++;
+		} else if (curIndex > 1 + frameSize) {
+			curIndex = 0;
+			crcIndex = 0;
+			frameSize = 0;
+			packetType = 0;
 		} else if (curIndex >= 2) {
 			if (curIndex == 2) {
 				packetType = uartChar;
 			}
-			if (packetType == 0x16) {
+			if (packetType == 0x16 && frameSize == 24 && curIndex-2 < sizeof(packetDataRaw)/sizeof(unsigned char)) {
 				// Packet data will be used for channel data and crc check
 				packetDataRaw[curIndex-2] = uartChar;
 			}
-//		} else if (curIndex >= frameSize) {
-//			continue;
+			curIndex++;
 		}
-		curIndex++;
 	}
+	uartBufferIndex = 0;
 
 	// Check CRC value
 	unsigned char crcDivisor = 0xD5;
-//	printf("CRC: %d\n", sizeof(packetDataRaw));
 	unsigned char crcResult = calculateCRC8(packetDataRaw, crcDivisor, sizeof(packetDataRaw));
-	if (crcResult != 0x01) {
+	if (crcResult == 0x00) {
+//		goodPackets++;
 		// Unpack channel data if CRC is correct
 		for (unsigned int curChannel = 0; curChannel < NUM_CHANNELS; curChannel++) {
 			channelData[curChannel] = 0;
@@ -148,12 +165,19 @@ void getReceiverData(unsigned int frame)
 			}
 		}
 	} else {
+//		badPackets++;
 		printf("Packet Lost\n");
 	}
+
+//	int linkQuality = (int)(100.0*(float)goodPackets/(float)(goodPackets+badPackets));
+//	if (frame%100 == 0) {
+//		printf("LQ: %d%%\n", linkQuality);
+//	}
 }
 
-char calculateCRC8(unsigned char* data, unsigned char divisor, unsigned int dataLenBytes) {
-	unsigned char crcRegister = 0;
+char calculateCRC8(unsigned char* data, unsigned char divisor, unsigned int dataLenBytes)
+{
+/*	unsigned char crcRegister = 0;
 	unsigned int dataLenBits = dataLenBytes*8;
 	unsigned int inputStreamIndex = 0;
 	while (inputStreamIndex < dataLenBits) {
@@ -173,5 +197,30 @@ char calculateCRC8(unsigned char* data, unsigned char divisor, unsigned int data
 		// Bitwise XOR crc register with divisor
 		crcRegister ^= divisor;
 	}
-	return crcRegister;
+	return crcRegister;*/
+	unsigned char crc = 0;
+	for (unsigned int i = 0; i < dataLenBytes; i++) {
+		crc ^= data[i];  // XOR input byte into crc
+		for (unsigned int bit = 0; bit < 8; bit++) {
+			if (crc & 0x80) {
+				crc = (crc << 1) ^ divisor;
+			} else {
+				crc <<= 1;
+			}
+		}
+	}
+	return crc;
+}
+
+void onUartRx()
+{
+	while (uart_is_readable(UART_ID)) {
+		unsigned char uartChar = uart_getc(UART_ID);
+		if (uartBufferIndex < UART_BUFFER_SIZE) {
+			uartBuffer[uartBufferIndex] = uartChar;
+			uartBufferIndex++;
+		} else {
+			uartBufferIndex = 0;
+		}
+	}
 }
